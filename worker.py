@@ -228,45 +228,13 @@ def _strip_video_metadata(path: str) -> None:
             os.unlink(tmp)
 
 
-def _extract_model_refs(workflow: dict) -> list[dict]:
-    """Extract model/lora/vae/clip references from the workflow."""
-    refs = []
-    LOADER_FIELDS = {
-        "CheckpointLoaderSimple": [("ckpt_name", {})],
-        "UNETLoader": [("unet_name", {})],
-        "CLIPLoader": [("clip_name", {})],
-        "VAELoader": [("vae_name", {})],
-        "LoraLoader": [("lora_name", {"strength_model": "strength_model", "strength_clip": "strength_clip"})],
-        "LoraLoaderModelOnly": [("lora_name", {"strength_model": "strength_model"})],
-    }
-
-    for _node_id, node in workflow.items():
-        if not isinstance(node, dict):
-            continue
-        class_type = node.get("class_type", "")
-        if class_type not in LOADER_FIELDS:
-            continue
-        inputs = node.get("inputs", {})
-        for field_name, extra_fields in LOADER_FIELDS[class_type]:
-            filename = inputs.get(field_name, "")
-            if not filename or not isinstance(filename, str):
-                continue
-            ref = {"filename": filename}
-            for out_key, in_key in extra_fields.items():
-                val = inputs.get(in_key)
-                if val is not None:
-                    ref[out_key] = val
-            refs.append(ref)
-
-    return refs
-
-
 def _compute_model_hashes(workflow: dict) -> dict:
     """Compute SHA256 hashes for all model files referenced in the workflow.
 
+    Uses _scan_all_model_refs to find all models (not just hardcoded loaders).
     Runs synchronously but designed to be called from a background thread.
     """
-    refs = _extract_model_refs(workflow)
+    refs = _scan_all_model_refs(workflow)
     result = {}
 
     for ref in refs:
@@ -284,9 +252,16 @@ def _compute_model_hashes(workflow: dict) -> dict:
                 "sha256": sha,
                 "type": _model_type_from_path(path),
             }
-            # Include strength for LoRAs (use strength_model value, 1 decimal)
-            if "strength_model" in ref:
-                entry["strength"] = round(float(ref["strength_model"]), 1)
+            # Include strength for LoRA nodes
+            node_id = ref.get("node_id", "")
+            node = workflow.get(node_id, {})
+            inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+            strength = inputs.get("strength_model")
+            if strength is not None:
+                try:
+                    entry["strength"] = round(float(strength), 1)
+                except (ValueError, TypeError):
+                    pass
             result[filename] = entry
         except Exception as e:
             result[filename] = {"error": str(e)}
