@@ -350,8 +350,14 @@ def _clean_error(error_msg: str) -> str:
         for node_id, info in node_errors.items():
             class_type = info.get("class_type", "unknown")
             for e in info.get("errors", []):
-                detail = e.get("details", e.get("message", "unknown error"))
-                lines.append(f"  Node {node_id} ({class_type}): {detail}")
+                extra_info = e.get("extra_info", {})
+                input_name = extra_info.get("input_name", "")
+                received = extra_info.get("received_value", "")
+                if input_name and received:
+                    lines.append(f"  Node {node_id} ({class_type}): '{received}' not found for input '{input_name}'")
+                else:
+                    detail = e.get("message", "unknown error")
+                    lines.append(f"  Node {node_id} ({class_type}): {detail}")
         return "\n".join(lines)
 
     # Generic ComfyUI error
@@ -660,6 +666,10 @@ def handler(job: dict) -> dict:
         elapsed = int(time.time() - start_time)
         print(f"@@JOB_END {job_id}", flush=True)
         error_msg = _clean_error(str(e))
+        # Cap error length — RunPod SDK may fail to POST very long errors,
+        # leaving the job stuck at IN_PROGRESS instead of transitioning to FAILED.
+        if len(error_msg) > 1000:
+            error_msg = error_msg[:1000] + "..."
         print(f"[job {job_id[:8]}] FAILED after {elapsed}s: {error_msg}", flush=True)
         # Raise so RunPod SDK marks the job as FAILED (not stuck IN_PROGRESS)
         raise RuntimeError(error_msg) from None
