@@ -24,10 +24,15 @@ def queue_prompt(workflow: dict) -> tuple[str, str]:
     try:
         resp = json.loads(urllib.request.urlopen(req).read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")[:1000]
-        raise RuntimeError(f"ComfyUI /prompt returned {e.code}: {body}") from e
+        body = e.read().decode(errors="replace")
+        # Try to parse ComfyUI's structured error response
+        try:
+            err_data = json.loads(body)
+            raise RuntimeError(json.dumps(err_data)) from e
+        except (json.JSONDecodeError, ValueError):
+            raise RuntimeError(f"ComfyUI /prompt returned {e.code}: {body[:500]}") from e
     if "error" in resp:
-        raise RuntimeError(f"ComfyUI error: {json.dumps(resp['error'])[:500]}")
+        raise RuntimeError(json.dumps(resp))
     return resp["prompt_id"], client_id
 
 
