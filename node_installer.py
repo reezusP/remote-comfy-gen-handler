@@ -307,15 +307,24 @@ def parse_missing_node_from_error(error_msg: str) -> str | None:
     return m.group(1) if m else None
 
 
-def ensure_nodes(workflow: dict, max_retries: int = 3) -> list[str]:
+def ensure_nodes(workflow: dict, max_retries: int = 3, progress_fn=None) -> list[str]:
     """Check workflow for missing nodes and install them.
 
     Resolution strategy:
     1. Try ComfyUI-Manager API (preemptions + star-count ranking)
     2. Fall back to raw GitHub extension-node-map if Manager unavailable
 
+    Args:
+        workflow: ComfyUI API-format workflow dict.
+        max_retries: Max retry attempts for node installation.
+        progress_fn: Optional callback(message: str) for progress updates.
+
     Returns list of newly installed repo names.
     """
+    def _progress(msg: str) -> None:
+        if progress_fn:
+            progress_fn(msg)
+
     installed_types = get_installed_node_types()
     required_types = extract_class_types(workflow)
     missing = required_types - installed_types
@@ -324,6 +333,7 @@ def ensure_nodes(workflow: dict, max_retries: int = 3) -> list[str]:
         return []
 
     print(f"[node_installer] Missing node types: {missing}", flush=True)
+    _progress(f"Resolving {len(missing)} missing custom node(s)")
 
     # Try ComfyUI-Manager API first (preemptions applied, star ranking)
     mappings = _get_manager_mappings()
@@ -368,16 +378,19 @@ def ensure_nodes(workflow: dict, max_retries: int = 3) -> list[str]:
 
     # Install all missing repos (force deps if dir exists but nodes aren't loaded)
     installed_repos = []
-    for repo_url, types in repos.items():
+    total = len(repos)
+    for i, (repo_url, types) in enumerate(repos.items()):
         repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
         target = os.path.join(CUSTOM_NODES_DIR, repo_name)
         dir_exists = os.path.exists(target)
         print(f"[node_installer] {repo_name} provides: {types}", flush=True)
+        _progress(f"Installing {repo_name} ({i+1}/{total})")
         if install_repo(repo_url, force_deps=dir_exists):
             installed_repos.append(repo_name)
 
     # Restart ComfyUI to pick up new nodes
     if installed_repos:
+        _progress(f"Restarting ComfyUI after installing {len(installed_repos)} node(s)")
         if not restart_comfyui():
             raise RuntimeError("Failed to restart ComfyUI after installing nodes")
 

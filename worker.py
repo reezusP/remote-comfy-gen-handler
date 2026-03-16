@@ -19,7 +19,6 @@ import runpod
 
 import comfy_client
 import node_installer
-import preflight
 import storage
 
 
@@ -432,11 +431,13 @@ def handler(job: dict) -> dict:
         # Uses filesystem scan (no ComfyUI needed) to detect missing nodes,
         # installs them, and restarts ComfyUI if anything was added.
         _send_progress(job, "node_check", "Checking custom nodes", percent=10)
-        installed = preflight.ensure_nodes(workflow)
+
+        def _node_progress(msg: str) -> None:
+            _send_progress(job, "node_check", msg, percent=11)
+
+        installed = node_installer.ensure_nodes(workflow, progress_fn=_node_progress)
         if installed:
-            print(f"[job {job_id[:8]}] Pre-flight installed nodes: {installed}")
-            _send_progress(job, "node_check", f"Installed {len(installed)} nodes, restarting ComfyUI", percent=12)
-            node_installer.restart_comfyui()
+            print(f"[job {job_id[:8]}] Installed custom nodes: {installed}")
 
         print(f"[job {job_id[:8]}] Queuing prompt...")
         _send_progress(job, "queue", "Queuing prompt", percent=15)
@@ -446,7 +447,8 @@ def handler(job: dict) -> dict:
             missing_node = node_installer.parse_missing_node_from_error(str(e))
             if missing_node:
                 print(f"[job {job_id[:8]}] ComfyUI rejected: missing {missing_node}. Attempting install...")
-                node_installer.ensure_nodes(workflow, max_retries=1)
+                _send_progress(job, "node_check", f"Installing missing node: {missing_node}", percent=11)
+                node_installer.ensure_nodes(workflow, max_retries=1, progress_fn=_node_progress)
                 prompt_id, client_id = comfy_client.queue_prompt(workflow)
             else:
                 raise
