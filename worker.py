@@ -120,15 +120,50 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+SAMPLER_SEED_FIELDS = {
+    "KSampler": "seed",
+    "KSamplerAdvanced": "noise_seed",
+    "SamplerCustom": "noise_seed",
+    "SamplerCustomAdvanced": "noise_seed",
+}
+
+
+def _randomize_seeds(workflow: dict, overrides: dict) -> None:
+    """Randomize seeds for all sampler nodes not explicitly overridden.
+
+    Generates a single random seed and applies it to every sampler node
+    whose seed field was not set via overrides. This ensures reproducibility
+    within a single job (all samplers share the same seed) while varying
+    across jobs.
+    """
+    import random
+    random_seed = random.randint(0, 2**53 - 1)
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        seed_field = SAMPLER_SEED_FIELDS.get(class_type)
+        if not seed_field:
+            continue
+        # Skip if the user explicitly overrode this seed
+        if node_id in overrides and seed_field in overrides[node_id]:
+            continue
+        node.setdefault("inputs", {})[seed_field] = random_seed
+
+
 def _extract_seed(workflow: dict) -> int | None:
-    """Extract seed from KSampler node in the workflow."""
+    """Extract seed from the first sampler node in the workflow."""
     for node in workflow.values():
         if not isinstance(node, dict):
             continue
-        if node.get("class_type") in ("KSampler", "KSamplerAdvanced"):
-            seed = node.get("inputs", {}).get("seed")
-            if isinstance(seed, (int, float)):
-                return int(seed)
+        class_type = node.get("class_type", "")
+        seed_field = SAMPLER_SEED_FIELDS.get(class_type)
+        if not seed_field:
+            continue
+        seed = node.get("inputs", {}).get(seed_field)
+        if isinstance(seed, (int, float)):
+            return int(seed)
     return None
 
 
@@ -632,6 +667,9 @@ def handler(job: dict) -> dict:
         for node_id, params in overrides.items():
             if node_id in workflow:
                 workflow[node_id]["inputs"].update(params)
+
+        # --- Step 2a: Randomize seeds (unless explicitly overridden) ---
+        _randomize_seeds(workflow, overrides)
 
         # --- Start model hashing in background (after overrides applied) ---
         hash_result = {}
