@@ -636,6 +636,9 @@ def handler(job: dict) -> dict:
     if command == "hash":
         import hash_handler
         return hash_handler.handle(job)
+    if command == "object_info":
+        import object_info_handler
+        return object_info_handler.handle(job)
 
     start_time = time.time()
     job_id = job.get("id", "unknown")
