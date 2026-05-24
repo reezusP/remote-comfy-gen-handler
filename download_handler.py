@@ -19,6 +19,7 @@ relative path under MODELS_BASE — e.g. `"loras/sub/m.safetensors"` resolves to
 """
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -366,3 +367,36 @@ def handle(job: dict) -> dict:
     print(f"[job {job_id[:8]}] Download complete: {len(results)} file(s) in {elapsed}s")
 
     return {"ok": True, "files": results}
+
+
+def _cli_main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for the CPU installer pod (`python -m download_handler`).
+
+    Reads a job dict (same shape as the worker dispatch input — `{"input": {...}}`)
+    from --job FILE or stdin, runs handle(), prints the result as JSON to stdout,
+    and returns 0 iff result["ok"] is truthy. Lets exceptions propagate so the
+    pod's exit code (non-zero) signals failure to the installer poller.
+    """
+    import argparse
+    import sys
+
+    p = argparse.ArgumentParser(
+        description="Download handler CLI mode — used by the CPU installer pod."
+    )
+    p.add_argument("--job", help="Path to job JSON file (omit to read stdin).")
+    args = p.parse_args(argv)
+
+    if args.job:
+        with open(args.job) as f:
+            job = json.load(f)
+    else:
+        job = json.load(sys.stdin)
+
+    result = handle(job)
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli_main())
