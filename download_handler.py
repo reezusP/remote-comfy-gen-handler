@@ -310,6 +310,11 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
 
     for i, dl in enumerate(downloads):
         source = dl.get("source", "")
+        # `huggingface` is a schema alias from blockflow-presets — functionally
+        # an aria2c URL fetch, identical to source=`url`. Normalize at entry so
+        # the rest of the dispatch (announce, dedup, error msg) stays one path.
+        if source == "huggingface":
+            source = "url"
         dest, override_filename = _resolve_target(dl)
         dest_dir = os.path.join(MODELS_BASE, dest)
         expected_sha = dl.get("sha256")
@@ -367,7 +372,9 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 )
 
         else:
-            raise RuntimeError(f"Download {i+1}: unknown source '{source}'. Use 'civitai' or 'url'.")
+            raise RuntimeError(
+                f"Download {i+1}: unknown source '{dl.get('source','')}'. "
+                f"Use 'civitai', 'url', or 'huggingface' (alias for 'url').")
 
         # Post-download sha256 verification (skip if we just confirmed via cache).
         if expected_sha and not cached:
