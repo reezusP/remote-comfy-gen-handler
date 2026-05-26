@@ -100,8 +100,13 @@ def _download_civitai(
     """
     os.makedirs(dest_dir, exist_ok=True)
 
-    # List files before download to detect the new file
+    # List files before download as a fallback for detecting what landed.
+    # Primary path: parse the CivitAI script's "Model ready at: <path>" line.
+    # Diff is unreliable when a prior attempt left files in the dest (resume
+    # case): aria2c writes the same filename in place and `after - before` is
+    # empty even though the download succeeded.
     before = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
+    model_ready_path: str | None = None
 
     job_tag = (job.get("id", "")[:8] if job else "") or "civitai"
 
@@ -125,6 +130,13 @@ def _download_civitai(
             if not line:
                 continue
             output_lines.append(line)
+            # The script emits "✅ Model ready at: /abs/path/to/file" on success.
+            # Capture the path so we don't need to guess from a directory diff.
+            if "Model ready at:" in line and model_ready_path is None:
+                _, _, path_part = line.partition("Model ready at:")
+                candidate = path_part.strip()
+                if candidate and os.path.isfile(candidate):
+                    model_ready_path = candidate
             # Surface every line to the worker log so RunPod's log viewer shows
             # live progress. The script's own format (aria2c summary lines,
             # status messages from CivitAI_Downloader) is the most useful thing
@@ -170,19 +182,29 @@ def _download_civitai(
             f"CivitAI download failed (exit {proc.returncode}): {tail}"
         )
 
-    # Find newly downloaded file(s)
-    after = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
-    new_files = after - before
+    # Resolve the resulting file.
+    # Priority 1: the script told us the path via "Model ready at:".
+    # Priority 2: directory diff (works for clean dests).
+    # Priority 3: if both fail, treat any newly-mtime'd .safetensors/.gguf/.bin
+    #             as a fallback — last-ditch, but covers resume cases where
+    #             aria2c wrote the same filename twice.
+    if model_ready_path:
+        filepath = model_ready_path
+        filename = os.path.basename(filepath)
+    else:
+        after = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
+        # Ignore aria2's partial-state files when picking the result.
+        new_files = {f for f in (after - before) if not f.endswith(".aria2")}
+        if new_files:
+            filename = sorted(new_files)[0]
+            filepath = os.path.join(dest_dir, filename)
+        else:
+            tail = "\n".join(output_lines[-20:]).strip()
+            raise RuntimeError(
+                f"CivitAI download produced no new files and no 'Model ready at:' "
+                f"line was emitted. tail: {tail}"
+            )
 
-    if not new_files:
-        tail = "\n".join(output_lines[-20:]).strip()
-        raise RuntimeError(
-            f"CivitAI download produced no new files. tail: {tail}"
-        )
-
-    # Return info about the first new file (usually there's only one)
-    filename = sorted(new_files)[0]
-    filepath = os.path.join(dest_dir, filename)
     size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 1)
 
     return {
