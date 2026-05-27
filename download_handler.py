@@ -26,6 +26,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable
 
 import runpod
@@ -133,6 +134,35 @@ def _sha256_file_with_heartbeat(
                 print(f"[job {job_tag}] still hashing {label} — "
                       f"{mb:.0f}MB at {rate:.0f}MB/s ({elapsed:.0f}s in)", flush=True)
     return h.hexdigest()
+
+
+# Background pool for post-download sha256 verification. Single thread —
+# disk-bound, parallelism doesn't help and we don't want concurrent giant reads
+# competing on the network volume. Lazy-init so import-time stays cheap.
+_VERIFY_POOL: ThreadPoolExecutor | None = None
+_pending_verifications: list[tuple[int, dict, Future, str]] = []
+
+
+def _verify_pool() -> ThreadPoolExecutor:
+    global _VERIFY_POOL
+    if _VERIFY_POOL is None:
+        _VERIFY_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="civitai-verify")
+    return _VERIFY_POOL
+
+
+def _async_verify_sha256(path: str, expected: str, *, job_tag: str, label: str) -> str:
+    """Compute sha256, raise on mismatch. Designed to run in _verify_pool."""
+    actual = _sha256_file_with_heartbeat(path, job_tag, label)
+    if actual != expected:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"sha256 mismatch for {label}: expected {expected}, got {actual}. "
+            f"Corrupt file removed."
+        )
+    return actual
 
 
 def _split_destination_path(destination_path: str) -> tuple[str, str]:
@@ -395,6 +425,7 @@ def _download_url(
     total_items: int = 1,
     progress_callback: Callable[[dict], None] | None = None,
     timeout_sec: int = 600,
+    expected_sha: str | None = None,
 ) -> dict:
     """Download a file from a direct URL using aria2c with progress streaming.
 
@@ -417,15 +448,25 @@ def _download_url(
         if "?" in filename:
             filename = filename.split("?")[0]
 
+    # Build aria2c command. When expected_sha is supplied we ask aria2c to
+    # verify in-flight via --checksum — aria2c already streams the bytes for
+    # writing, so adding a hash to the same pipe is essentially free. On
+    # mismatch aria2c exits non-zero and we delete the corrupt file, identical
+    # outcome to the post-download verify but without the second pass over the
+    # entire file (saves 30-180s on multi-GB downloads over network volume).
+    aria_cmd = [
+        "aria2c", "-d", dest_dir, "-o", filename,
+        "--allow-overwrite=true",
+        "--summary-interval=3",
+        "--console-log-level=notice",
+    ]
+    if expected_sha:
+        aria_cmd.append(f"--checksum=sha-256={expected_sha.lower()}")
+    aria_cmd.append(url)
+
     # Stream aria2c output to capture real-time progress
     proc = subprocess.Popen(
-        [
-            "aria2c", "-d", dest_dir, "-o", filename,
-            "--allow-overwrite=true",
-            "--summary-interval=3",
-            "--console-log-level=notice",
-            url,
-        ],
+        aria_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -467,13 +508,24 @@ def _download_url(
 
     proc.wait(timeout=timeout_sec)
 
+    filepath = os.path.join(dest_dir, filename)
     if proc.returncode != 0:
         full_output = "".join(output_lines).strip()
+        # aria2c exit 32 = checksum mismatch. Surface as a sha256 mismatch
+        # error and remove the corrupt file so retries start clean.
+        if proc.returncode == 32 and expected_sha:
+            try:
+                os.unlink(filepath)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"sha256 mismatch for {filename} (expected {expected_sha}): "
+                f"aria2c --checksum verification failed. Corrupt file removed."
+            )
         raise RuntimeError(
             f"aria2c download failed (exit {proc.returncode}): {full_output}"
         )
 
-    filepath = os.path.join(dest_dir, filename)
     if not os.path.isfile(filepath):
         raise RuntimeError(f"Download completed but file not found: {filepath}")
 
@@ -555,6 +607,10 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
     job_input = job["input"]
     job_id = job.get("id", "unknown")
     downloads = job_input.get("downloads", [])
+    # Each call gets a fresh verification queue. Module-global keeps the pool
+    # warm across calls but the per-call list must reset (test isolation +
+    # robust to mid-job exceptions in earlier handle() invocations).
+    _pending_verifications.clear()
 
     if not downloads:
         raise RuntimeError("No downloads specified. Provide a 'downloads' array.")
@@ -646,6 +702,7 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                     job=job, item_index=i, total_items=len(downloads),
                     progress_callback=progress_callback,
                     timeout_sec=subprocess_timeout,
+                    expected_sha=expected_sha,
                 )
 
         else:
@@ -653,31 +710,34 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 f"Download {i+1}: unknown source '{dl.get('source','')}'. "
                 f"Use 'civitai', 'url', or 'huggingface' (alias for 'url').")
 
-        # Post-download sha256 verification (skip if we just confirmed via cache).
-        # Heartbeats every 15s — on multi-GB files over a network volume this
-        # step can take minutes, and without logging the job looks hung between
-        # the script's "Model ready at:" line and our "Downloaded:" log (bead 8r7).
-        if expected_sha and not cached:
-            size_mb = round(os.path.getsize(info["path"]) / (1024 * 1024), 1)
-            print(f"[job {job_id[:8]}] Verifying sha256 of {info['filename']} ({size_mb} MB)...", flush=True)
-            verify_started = time.time()
-            actual_sha = _sha256_file_with_heartbeat(
-                info["path"], job_id[:8], info["filename"],
-            )
-            verify_elapsed = int(time.time() - verify_started)
-            if actual_sha != expected_sha:
-                try:
-                    os.unlink(info["path"])
-                except OSError:
-                    pass
-                raise RuntimeError(
-                    f"Download {i+1}: sha256 mismatch for {info['filename']}: "
-                    f"expected {expected_sha}, got {actual_sha}. Corrupt file removed."
-                )
-            print(f"[job {job_id[:8]}] sha256 verified for {info['filename']} in {verify_elapsed}s", flush=True)
-            info["sha256"] = actual_sha
-        elif expected_sha and cached:
+        # Post-download sha256 verification — three paths:
+        #   (a) cached hit: dedup already proved the sha; record it, no work.
+        #   (b) URL/HF download with expected_sha: aria2c verified in-flight
+        #       via --checksum=sha-256=..., so a non-zero exit would have
+        #       blown up above. No second pass needed.
+        #   (c) CivitAI download with expected_sha: the wrapped script doesn't
+        #       expose a checksum kwarg, so the file needs a post-hash. We
+        #       submit it to a background pool and continue dispatching the
+        #       NEXT download immediately. Results awaited at the end of the
+        #       loop (bead 8r7 follow-up: async verify).
+        if expected_sha and cached:
             info["sha256"] = expected_sha
+        elif expected_sha and source == "url":
+            # aria2c --checksum already verified. Trust it.
+            info["sha256"] = expected_sha.lower()
+            print(f"[job {job_id[:8]}] sha256 verified in-flight (aria2c --checksum) for {info['filename']}", flush=True)
+        elif expected_sha and source == "civitai":
+            size_mb = round(os.path.getsize(info["path"]) / (1024 * 1024), 1)
+            print(f"[job {job_id[:8]}] Verifying sha256 of {info['filename']} ({size_mb} MB) in background...", flush=True)
+            fut = _verify_pool().submit(
+                _async_verify_sha256,
+                info["path"], expected_sha.lower(),
+                job_tag=job_id[:8], label=info["filename"],
+            )
+            _pending_verifications.append((i, info, fut, expected_sha.lower()))
+            # info["sha256"] is filled in after the future resolves at the
+            # end of the loop. For now, mark it pending so callers can see.
+            info["sha256_pending"] = True
 
         info["dest"] = dest
         info["cached"] = cached
@@ -693,6 +753,20 @@ def handle(job: dict, progress_callback: Callable[[dict], None] | None = None) -
                 "bytes": info["bytes"],
                 "sha256": info.get("sha256"),
             })
+
+    # Drain async sha256 verifications. The CivitAI path submits these to a
+    # background pool so the next download can start immediately; we settle the
+    # results here so the whole batch succeeds-or-fails atomically.
+    if _pending_verifications:
+        print(f"[job {job_id[:8]}] Awaiting {len(_pending_verifications)} background sha256 verification(s)...", flush=True)
+        verify_wait_started = time.time()
+        for idx, info, fut, expected in _pending_verifications:
+            actual = fut.result()  # raises on mismatch — propagated to caller
+            info["sha256"] = actual
+            info.pop("sha256_pending", None)
+        verify_wait_elapsed = int(time.time() - verify_wait_started)
+        print(f"[job {job_id[:8]}] All sha256 verifications cleared in {verify_wait_elapsed}s", flush=True)
+        _pending_verifications.clear()
 
     elapsed = int(time.time() - start_time)
     _send_progress(job, f"Done — {len(results)} file(s) in {elapsed}s", percent=100)
