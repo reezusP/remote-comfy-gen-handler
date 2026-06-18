@@ -84,12 +84,33 @@ if [ "${EXPERIMENTAL:-}" = "true" ]; then
     PERF_FLAGS="--fast cublas_ops --use-flash-attention"
 fi
 
+# SageAttention: enable the global flag ONLY if a real kernel actually launches on
+# this GPU. The baked wheel is multi-arch (sm_80/sm_89/sm_120), but a scheduling
+# mismatch or a bad build must NOT take ComfyUI down — fall back to default
+# attention instead. Import success is NOT enough (that's what build-time checks
+# miss); we launch an actual kernel and require it to complete.
+SAGE_FLAG=""
+if python3 - >/dev/null 2>&1 <<'SAGEPROBE'
+import torch
+from sageattention import sageattn
+q = torch.randn(1, 8, 128, 64, dtype=torch.float16, device="cuda")
+sageattn(q, q.clone(), q.clone())
+torch.cuda.synchronize()
+SAGEPROBE
+then
+    SAGE_FLAG="--use-sage-attention"
+    echo "[start] SageAttention kernel probe passed — enabling --use-sage-attention"
+else
+    echo "[start] SageAttention kernel probe failed — using default attention"
+fi
+
 python3 main.py \
     --listen 0.0.0.0 \
     --port $COMFYUI_PORT \
     --disable-auto-launch \
     --disable-metadata \
     $PERF_FLAGS \
+    $SAGE_FLAG \
     $EXTRA_PATHS_FLAG \
     > >(tee "$COMFY_LOG") 2>&1 &
 
@@ -147,6 +168,9 @@ if [ -n "$BROKEN_NODES" ]; then
             --port $COMFYUI_PORT \
             --disable-auto-launch \
             --disable-metadata \
+            $PERF_FLAGS \
+            $SAGE_FLAG \
+            $EXTRA_PATHS_FLAG \
             &
         COMFYUI_PID=$!
 
