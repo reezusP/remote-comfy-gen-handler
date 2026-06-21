@@ -50,24 +50,32 @@ def _read_extra_paths(model_type: str) -> list[str]:
 
 
 def _list_files(directory: str) -> list[dict]:
-    """List model files in a directory (non-recursive)."""
+    """List model files in a directory (recursive).
+
+    Walks subfolders so that models nested under e.g. loras/z-image/ are
+    surfaced. The returned ``filename`` is the path RELATIVE to ``directory``
+    (e.g. ``z-image/sarah.safetensors``) — which is exactly the value ComfyUI's
+    LoraLoader/checkpoint dropdowns use for nested files.
+    """
     if not os.path.isdir(directory):
         return []
 
     files = []
-    for name in sorted(os.listdir(directory)):
-        _, ext = os.path.splitext(name)
-        if ext.lower() not in MODEL_EXTENSIONS:
-            continue
-        filepath = os.path.join(directory, name)
-        if not os.path.isfile(filepath):
-            continue
-        size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 1)
-        files.append({
-            "filename": name,
-            "path": filepath,
-            "size_mb": size_mb,
-        })
+    for root, _dirs, names in os.walk(directory):
+        for name in sorted(names):
+            _, ext = os.path.splitext(name)
+            if ext.lower() not in MODEL_EXTENSIONS:
+                continue
+            filepath = os.path.join(root, name)
+            if not os.path.isfile(filepath):
+                continue
+            rel = os.path.relpath(filepath, directory).replace(os.sep, "/")
+            size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 1)
+            files.append({
+                "filename": rel,
+                "path": filepath,
+                "size_mb": size_mb,
+            })
 
     return files
 
