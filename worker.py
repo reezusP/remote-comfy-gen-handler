@@ -113,16 +113,29 @@ MODEL_DIRS = [
 
 
 def _resolve_model_path(filename: str) -> str | None:
-    """Find a .safetensors file on the volume by walking model dirs."""
+    """Find a model file on the volume by walking model dirs.
+
+    Handles both plain names ("m.safetensors") and ComfyUI's subfolder-prefixed
+    refs ("wan/m.safetensors", used for nested files). For a prefixed ref we
+    match on the basename and then require the resolved path to end with the
+    full ref, so the correct subfolder copy is returned.
+    """
+    wanted = filename.replace("\\", "/")
+    base_name = wanted.rsplit("/", 1)[-1]
+    nested = "/" in wanted
     for base in MODEL_DIRS:
         if not os.path.isdir(base):
             continue
         for root, _dirs, files in os.walk(base):
-            if filename in files:
-                path = os.path.join(root, filename)
-                # Verify the file actually exists (catches broken symlinks)
-                if os.path.isfile(path):
-                    return path
+            if base_name not in files:
+                continue
+            path = os.path.join(root, base_name)
+            # Verify the file actually exists (catches broken symlinks)
+            if not os.path.isfile(path):
+                continue
+            if nested and not os.path.normpath(path).replace("\\", "/").endswith("/" + wanted):
+                continue
+            return path
     return None
 
 
